@@ -268,7 +268,7 @@ def run(data,
                 scale_coords(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
                 scale_coords(im[si].shape[1:], tpoly, shape, shapes[si][1])  # native-space labels
                 labels_hbbn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels (n, [cls xyxy])
-                labels_polyn = torch.cat((labels[:, 0:1], labels[:, 1] + tpoly), 1)  # native-space labels (n, [cls xyxy])
+                labels_polyn = torch.cat((labels[:, 0:1], tpoly), 1)  # native-space labels (n, [cls xyxy])
                 correct = process_batch(pred_hbbn, labels_hbbn, iouv)
                 # correct = process_batch_2(pred_polyn, labels_polyn, iouv)
                 if plots:
