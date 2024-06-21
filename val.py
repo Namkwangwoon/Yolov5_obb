@@ -28,7 +28,7 @@ ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 from models.common import DetectMultiBackend
 from utils.callbacks import Callbacks
 from utils.datasets import create_dataloader
-from utils.general import (LOGGER, box_iou, check_dataset, check_img_size, check_requirements, check_yaml,
+from utils.general import (LOGGER, box_iou, poly_iou, check_dataset, check_img_size, check_requirements, check_yaml,
                            coco80_to_coco91_class, colorstr, increment_path, non_max_suppression, print_args,
                            scale_coords, scale_polys, xywh2xyxy, xyxy2xywh, non_max_suppression_obb)
 from utils.metrics import ConfusionMatrix, ap_per_class
@@ -88,6 +88,32 @@ def process_batch(detections, labels, iouv):
         matches = torch.Tensor(matches).to(iouv.device)
         correct[matches[:, 1].long()] = matches[:, 2:3] >= iouv
     return correct
+
+
+def process_batch_2(polys, tpolys, iouv):
+    """
+    Return correct predictions matrix. Both sets of boxes are in (x1, y1, x2, y2, x3, y3, x4, y4) format.
+    Arguments:
+        polys (Array[N, 10]), x1, y1, x2, y2, x3, y3, x4, y4, conf, class
+        tpolys (Array[M, 9]), class, x1, y1, x2, y2, x3, y3, x4, y4
+    Returns:
+        correct (Array[N, 10]), for 10 IoU levels
+    """
+
+    correct = torch.zeros(polys.shape[0], iouv.shape[0], dtype=bool, device=iouv.device)
+    iou = poly_iou(tpolys[:, 1:], polys[:, :8])
+    x = torch.where((iou >= iouv[0]) & (tpolys[:, 0:1] == polys[:, 9]))  # IoU above threshold and classes match
+    if x[0].shape[0]:
+        matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()  # [label, detection, iou]
+        if x[0].shape[0] > 1:
+            matches = matches[matches[:, 2].argsort()[::-1]]
+            matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
+            # matches = matches[matches[:, 2].argsort()[::-1]]
+            matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
+        matches = torch.Tensor(matches).to(iouv.device)
+        correct[matches[:, 1].long()] = matches[:, 2:3] >= iouv
+    return correct
+
 
 
 @torch.no_grad()
@@ -236,27 +262,32 @@ def run(data,
 
             # Evaluate
             if nl:
-                # tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
+                tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
                 tpoly = rbox2poly(labels[:, 1:6]) # target poly
                 tbox = xywh2xyxy(poly2hbb(tpoly)) # target  hbb boxes [xyxy]
                 scale_coords(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
+                scale_coords(im[si].shape[1:], tpoly, shape, shapes[si][1])  # native-space labels
                 labels_hbbn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels (n, [cls xyxy])
+                labels_polyn = torch.cat((labels[:, 0:1], labels[:, 1] + tpoly), 1)  # native-space labels (n, [cls xyxy])
                 correct = process_batch(pred_hbbn, labels_hbbn, iouv)
+                # correct = process_batch_2(pred_polyn, labels_polyn, iouv)
                 if plots:
                     confusion_matrix.process_batch(pred_hbbn, labels_hbbn)
+                    # confusion_matrix.process_batch_2(pred_polyn, labels_polyn)
             else:
                 correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool)
-            # stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))  # (correct, conf, pcls, tcls)
-            stats.append((correct.cpu(), pred_poly[:, 8].cpu(), pred_poly[:, 9].cpu(), tcls))  # (correct, conf, pcls, tcls)
+            stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))  # (correct, conf, pcls, tcls)
+            # stats.append((correct.cpu(), pred_poly[:, 8].cpu(), pred_poly[:, 9].cpu(), tcls))  # (correct, conf, pcls, tcls)
 
-            # Save/log
-            if save_txt: # just save hbb pred results!
-                save_one_txt(pred_hbbn, save_conf, shape, file=save_dir / 'labels' / (path.stem + '.txt'))
-                # LOGGER.info('The horizontal prediction results has been saved in txt, which format is [cls cx cy w h /conf/]')
-            if save_json: # save hbb pred results and poly pred results.
-                save_one_json(pred_hbbn, pred_polyn, jdict, path, class_map)  # append to COCO-JSON dictionary
-                # LOGGER.info('The hbb and obb results has been saved in json file')
+            # # Save/log
+            # if save_txt: # just save hbb pred results!
+            #     save_one_txt(pred_hbbn, save_conf, shape, file=save_dir / 'labels' / (path.stem + '.txt'))
+            #     # LOGGER.info('The horizontal prediction results has been saved in txt, which format is [cls cx cy w h /conf/]')
+            # if save_json: # save hbb pred results and poly pred results.
+            #     save_one_json(pred_hbbn, pred_polyn, jdict, path, class_map)  # append to COCO-JSON dictionary
+            #     # LOGGER.info('The hbb and obb results has been saved in json file')
             callbacks.run('on_val_image_end', pred_hbb, pred_hbbn, path, names, im[si])
+            # callbacks.run('on_val_image_end', pred_poly, pred_polyn, path, names, im[si])
 
         # Plot images
         if plots and batch_i < 3:
@@ -268,6 +299,9 @@ def run(data,
     # Compute metrics
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
     if len(stats) and stats[0].any():
+        print()
+        print('1!!')
+        print()
         tp, fp, p, r, f1, ap, ap_class = ap_per_class(*stats, plot=plots, save_dir=save_dir, names=names)
         ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
         mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
@@ -297,6 +331,9 @@ def run(data,
 
     # Save JSON
     if save_json and len(jdict):
+        print()
+        print('2!!')
+        print()
         w = Path(weights[0] if isinstance(weights, list) else weights).stem if weights is not None else ''  # weights
         anno_json = str(Path(data.get('path', '../coco')) / 'annotations/instances_val2017.json')  # annotations json
         pred_json = str(save_dir / f"{w}_obb_predictions.json")  # predictions json
@@ -335,7 +372,7 @@ def run(data,
 
 def parse_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data', type=str, default=ROOT / 'data/DroneVehicle_poly.yaml', help='dataset.yaml path')
+    parser.add_argument('--data', type=str, default=ROOT / 'data/Mobis.yaml', help='dataset.yaml path')
     parser.add_argument('--weights', nargs='+', type=str, default=ROOT / 'runs/train/yolov5n_DroneVehicle/weights/best.pt', help='model.pt path(s)')
     parser.add_argument('--batch-size', type=int, default=8, help='batch size')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=1024, help='inference size (pixels)')

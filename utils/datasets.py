@@ -31,11 +31,19 @@ from utils.general import (LOGGER, NUM_THREADS, check_dataset, check_requirement
 from utils.torch_utils import torch_distributed_zero_first
 from utils.rboxs_utils import poly_filter, poly2rbox
 
+import orjson
+import matplotlib.pyplot as plt
+
+
 # Parameters
 HELP_URL = 'https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data'
 IMG_FORMATS = ['bmp', 'jpg', 'jpeg', 'png', 'tif', 'tiff', 'dng', 'webp', 'mpo']  # acceptable image suffixes
 VID_FORMATS = ['mov', 'avi', 'mp4', 'mpg', 'mpeg', 'm4v', 'wmv', 'mkv']  # acceptable video suffixes
 WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))  # DPP
+
+CLASSES = {"BOX":0, "LH":1, "RH":2}
+CLASSES_2 = {"box":0}
+
 
 # Get orientation exif tag
 for orientation in ExifTags.TAGS.keys():
@@ -92,13 +100,14 @@ def exif_transpose(image):
     return image
 
 
-def create_dataloader(path, imgsz, batch_size, stride, names, single_cls=False, hyp=None, augment=False, cache=False, pad=0.0,
-                      rect=False, rank=-1, workers=8, image_weights=False, quad=False, prefix='', shuffle=False):
+def create_dataloader(path, mode, imgsz, batch_size, stride, names, single_cls=False, hyp=None, augment=False, cache=False, pad=0.0, rect=False, rank=-1, workers=8, image_weights=False, quad=False, prefix='', shuffle=False):
     if rect and shuffle:
         LOGGER.warning('WARNING: --rect is incompatible with DataLoader shuffle, setting shuffle=False')
         shuffle = False
     with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
-        dataset = LoadImagesAndLabels(path, names, imgsz, batch_size,
+        # dataset = LoadImagesAndLabels(path, names, imgsz, batch_size,
+        dataset = LoadMobisImagesAndLabels(path, mode, names, imgsz, batch_size,
+        # dataset = LoadMobis2ImagesAndLabels(path, mode, names, imgsz, batch_size,
                                       augment=augment,  # augmentation
                                       hyp=hyp,  # hyperparameters
                                       rect=rect,  # rectangular batches
@@ -119,7 +128,9 @@ def create_dataloader(path, imgsz, batch_size, stride, names, single_cls=False, 
                   num_workers=nw,
                   sampler=sampler,
                   pin_memory=True,
-                  collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn), dataset
+                  # collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn), dataset
+                  collate_fn=LoadMobisImagesAndLabels.collate_fn4 if quad else LoadMobisImagesAndLabels.collate_fn), dataset
+                  # collate_fn=LoadMobis2ImagesAndLabels.collate_fn4 if quad else LoadMobis2ImagesAndLabels.collate_fn), dataset
 
 
 class InfiniteDataLoader(dataloader.DataLoader):
@@ -156,7 +167,7 @@ class _RepeatSampler:
             yield from iter(self.sampler)
 
 
-class LoadImages:
+class LoadMobisImages:
     # YOLOv5 image/video dataloader, i.e. `python detect.py --source image.jpg/vid.mp4`
     def __init__(self, path, img_size=640, stride=32, auto=True):
         p = str(Path(path).resolve())  # os-agnostic absolute path
@@ -169,9 +180,15 @@ class LoadImages:
         else:
             raise Exception(f'ERROR: {p} does not exist')
 
-        images = [x for x in files if x.split('.')[-1].lower() in IMG_FORMATS]
+        # images = [x for x in files if x.split('.')[-1].lower() in IMG_FORMATS]
+        images = []
+        with open('../dataset/mobis/annotations/val.json') as f:
+            anno = orjson.loads(f.read())
+            for val_im in anno['images']:
+                images.append(os.path.join(p, val_im['file_name']))
         videos = [x for x in files if x.split('.')[-1].lower() in VID_FORMATS]
         ni, nv = len(images), len(videos)
+
 
         self.img_size = img_size
         self.stride = stride
@@ -217,6 +234,111 @@ class LoadImages:
             # Read image
             self.count += 1
             img0 = cv2.imread(path)  # BGR
+
+
+            ## Random Rotate
+            # img0, _ = random_rotate(img0, None)
+            # img0, _ = random_shift(img0, None)
+            
+            
+            assert img0 is not None, f'Image Not Found {path}'
+            s = f'image {self.count}/{self.nf} {path}: '
+
+        # Padded resize
+        img = letterbox(img0, self.img_size, stride=self.stride, auto=self.auto)[0]
+
+        # Convert
+        img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+        img = np.ascontiguousarray(img)
+
+        return path, img, img0, self.cap, s
+
+    def new_video(self, path):
+        self.frame = 0
+        self.cap = cv2.VideoCapture(path)
+        self.frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    def __len__(self):
+        return self.nf  # number of files
+
+class LoadMobis2Images:
+    # YOLOv5 image/video dataloader, i.e. `python detect.py --source image.jpg/vid.mp4`
+    def __init__(self, path, img_size=640, stride=32, auto=True):
+        p = str(Path(path).resolve())  # os-agnostic absolute path
+        if '*' in p:
+            files = sorted(glob.glob(p, recursive=True))  # glob
+        elif os.path.isdir(p):
+            files = sorted(glob.glob(os.path.join(p, '*.PNG')))  # dir
+        elif os.path.isfile(p):
+            files = [p]  # files
+        else:
+            raise Exception(f'ERROR: {p} does not exist')
+
+        n = len(files)
+        files = files[n*4//5:]
+
+        # images = [x for x in files if x.split('.')[-1].lower() in IMG_FORMATS]
+        images = []
+        
+        for f in files:
+            images.append(os.path.join(p, f))
+        videos = [x for x in files if x.split('.')[-1].lower() in VID_FORMATS]
+        ni, nv = len(images), len(videos)
+
+
+        self.img_size = img_size
+        self.stride = stride
+        self.files = images + videos
+        self.nf = ni + nv  # number of files
+        self.video_flag = [False] * ni + [True] * nv
+        self.mode = 'image'
+        self.auto = auto
+        if any(videos):
+            self.new_video(videos[0])  # new video
+        else:
+            self.cap = None
+        assert self.nf > 0, f'No images or videos found in {p}. ' \
+                            f'Supported formats are:\nimages: {IMG_FORMATS}\nvideos: {VID_FORMATS}'
+
+    def __iter__(self):
+        self.count = 0
+        return self
+
+    def __next__(self):
+        if self.count == self.nf:
+            raise StopIteration
+        path = self.files[self.count]
+
+        print("path : ", path)
+
+        if self.video_flag[self.count]:
+            # Read video
+            self.mode = 'video'
+            ret_val, img0 = self.cap.read()
+            while not ret_val:
+                self.count += 1
+                self.cap.release()
+                if self.count == self.nf:  # last video
+                    raise StopIteration
+                else:
+                    path = self.files[self.count]
+                    self.new_video(path)
+                    ret_val, img0 = self.cap.read()
+
+            self.frame += 1
+            s = f'video {self.count + 1}/{self.nf} ({self.frame}/{self.frames}) {path}: '
+
+        else:
+            # Read image
+            self.count += 1
+            img0 = cv2.imread(path)  # BGR
+
+
+            ## Random Rotate
+            # img0, _ = random_rotate(img0, None)
+            # img0, _ = random_shift(img0, None)
+            
+            
             assert img0 is not None, f'Image Not Found {path}'
             s = f'image {self.count}/{self.nf} {path}: '
 
@@ -370,16 +492,14 @@ class LoadStreams:
 
 def img2label_paths(img_paths):
     # Define label paths as a function of image paths
-    sa, sb = os.sep + 'images' + os.sep, os.sep + 'labelTxt' + os.sep  # /images/, /labels/ substrings
-    return [sb.join(x.rsplit(sa, 1)).rsplit('.', 1)[0] + '.txt' for x in img_paths]
+    return [p[:-3]+'json' for p in img_paths]
 
 
-class LoadImagesAndLabels(Dataset):
+class LoadMobisImagesAndLabels(Dataset):
     # YOLOv5 train_loader/val_loader, loads images and labels for training and validation
     cache_version = 0.6  # dataset labels *.cache version
 
-    def __init__(self, path, cls_names, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
-                 cache_images=False, single_cls=False, stride=32, pad=0.0, prefix=''):
+    def __init__(self, path, mode, cls_names, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False, cache_images=False, single_cls=False, stride=32, pad=0.0, prefix=''):
         """
         Returns:
             Dataset.labels (list): n_imgs * array(num_gt_perimg, [cls_id, poly])
@@ -395,77 +515,71 @@ class LoadImagesAndLabels(Dataset):
         self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
-        self.path = path
+        self.path = '/root/jupyter/personal/dataset/mobis'
         self.albumentations = Albumentations() if augment else None
         self.cls_names = cls_names
+        self.mode = mode
+        self.anno_path = {'train' : os.path.join(self.path, 'annotations', 'train.json'),
+                          'val' : os.path.join(self.path, 'annotations', 'val.json')}[mode]
 
-        try:
-            f = []  # image files
-            for p in path if isinstance(path, list) else [path]:
-                p = Path(p)  # os-agnostic
-                if p.is_dir():  # dir
-                    f += glob.glob(str(p / '**' / '*.*'), recursive=True)
-                    # f = list(p.rglob('*.*'))  # pathlib
-                elif p.is_file():  # file
-                    with open(p) as t:
-                        t = t.read().strip().splitlines()
-                        parent = str(p.parent) + os.sep
-                        f += [x.replace('./', parent) if x.startswith('./') else x for x in t]  # local to global path
-                        # f += [p.parent / x.lstrip(os.sep) for x in t]  # local to global path (pathlib)
-                else:
-                    raise Exception(f'{prefix}{p} does not exist')
-            self.img_files = sorted(x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in IMG_FORMATS)
-            # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in IMG_FORMATS])  # pathlib
-            assert self.img_files, f'{prefix}No images found'
-        except Exception as e:
-            raise Exception(f'{prefix}Error loading data from {path}: {e}\nSee {HELP_URL}')
+        with open(self.anno_path) as f:
+            self.img_files = [os.path.join(self.path, 'org', i['file_name']) for i in orjson.loads(f.read())['images']]
+        
+        assert self.img_files, f'{prefix}No images found'
 
         # Check cache
         self.label_files = img2label_paths(self.img_files)  # labels
-        cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')
-        try:
-            cache, exists = np.load(cache_path, allow_pickle=True).item(), True  # load dict
-            assert cache['version'] == self.cache_version  # same version
-            assert cache['hash'] == get_hash(self.label_files + self.img_files)  # same hash
-        except:
-            cache, exists = self.cache_labels(cache_path, prefix), False  # cache
+        # cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')
+        # try:
+        #     cache, exists = np.load(cache_path, allow_pickle=True).item(), True  # load dict
+        #     assert cache['version'] == self.cache_version  # same version
+        #     assert cache['hash'] == get_hash(self.label_files + self.img_files)  # same hash
+        # except:
+        #     cache, exists = self.cache_labels(cache_path, prefix), False  # cache
 
-        # Display cache
-        nf, nm, ne, nc, n = cache.pop('results')  # found, missing, empty, corrupted, total
-        if exists:
-            d = f"Scanning '{cache_path}' images and labels... {nf} found, {nm} missing, {ne} empty, {nc} corrupted"
-            tqdm(None, desc=prefix + d, total=n, initial=n)  # display cache results
-            if cache['msgs']:
-                LOGGER.info('\n'.join(cache['msgs']))  # display warnings
-        assert nf > 0 or not augment, f'{prefix}No labels in {cache_path}. Can not train without labels. See {HELP_URL}'
-
-        # Read cache
-        [cache.pop(k) for k in ('hash', 'version', 'msgs')]  # remove items
-        labels, shapes, self.segments = zip(*cache.values())
-        self.labels = list(labels) # labels(list[array]): n_imgs * array(num_gt_perimg, [cls_id, poly])
-        self.shapes = np.array(shapes, dtype=np.float64) # img_ori shape
-        self.img_files = list(cache.keys())  # update
-        self.label_files = img2label_paths(cache.keys())  # update
-        n = len(shapes)  # number of images
-        bi = np.floor(np.arange(n) / batch_size).astype(np.int)  # batch index
+        # # Read cache
+        # [cache.pop(k) for k in ('hash', 'version', 'msgs')]  # remove items
+        # labels, shapes, self.segments = zip(*cache.values())
+        # self.labels = list(labels) # labels(list[array]): n_imgs * array(num_gt_perimg, [cls_id, poly])
+        # self.shapes = np.array(shapes, dtype=np.float64) # img_ori shape
+        # self.img_files = list(cache.keys())  # update
+        # self.label_files = img2label_paths(cache.keys())  # update
+        # n = len(shapes)  # number of images
+        n = len(self.img_files)
+        bi = np.floor(np.arange(n) / batch_size).astype(int)  # batch index
         nb = bi[-1] + 1  # number of batches
         self.batch = bi  # batch index of image
         self.n = n
-        self.indices = range(n)
+        # self.indices = range(n)
 
-        # Update labels
-        include_class = []  # filter labels to include only these classes (optional)
-        include_class_array = np.array(include_class).reshape(1, -1)
-        for i, (label, segment) in enumerate(zip(self.labels, self.segments)):
-            if include_class:
-                j = (label[:, 0:1] == include_class_array).any(1)
-                self.labels[i] = label[j]
-                if segment:
-                    self.segments[i] = segment[j]
-            if single_cls:  # single-class training, merge all classes into 0
-                self.labels[i][:, 0] = 0
-                if segment:
-                    self.segments[i][:, 0] = 0
+        self.labels = []
+        for l_f in self.label_files:
+            with open(l_f) as f:
+                anno = orjson.loads(f.read())
+                anno = anno['shapes'][-1]
+
+                boxes = anno['points']
+                classes = anno['label']
+                
+                self.labels.append([[CLASSES[classes]]+sum(boxes, [])])    # [n_boxes, [class, x1, y1, x2, y1, ...]]
+        self.labels = np.array(self.labels)
+        self.shapes = np.array([[480, 512]]*self.n)
+        self.indices = range(self.n)
+        
+        # # Update labels
+        # include_class = []  # filter labels to include only these classes (optional)
+        # include_class_array = np.array(include_class).reshape(1, -1)
+        # for i, (label, segment) in enumerate(zip(self.labels, self.segments)):
+        #     if include_class:
+        #         j = (label[:, 0:1] == include_class_array).any(1)
+        #         self.labels[i] = label[j]
+        #         if segment:
+        #             self.segments[i] = segment[j]
+        #     if single_cls:  # single-class training, merge all classes into 0
+        #         self.labels[i][:, 0] = 0
+        #         if segment:
+        #             self.segments[i][:, 0] = 0
+        self.segment = None
 
         # Rectangular Training
         if self.rect:
@@ -489,29 +603,31 @@ class LoadImagesAndLabels(Dataset):
                 elif mini > 1: # batch图像高宽比均大于1时, shape=[1, w/h] = [h_ratio, w_ratio]
                     shapes[i] = [1, 1 / mini]
 
-            self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(np.int) * stride # (nb, [h_rect, w_rect])
+            self.batch_shapes = np.ceil(np.array(shapes) * (480, 512) / stride + pad).astype(int) * stride # (nb, [h_rect, w_rect])
 
-        # Cache images into memory for faster training (WARNING: large datasets may exceed system RAM)
-        self.imgs, self.img_npy = [None] * n, [None] * n
-        if cache_images:
-            if cache_images == 'disk':
-                self.im_cache_dir = Path(Path(self.img_files[0]).parent.as_posix() + '_npy')
-                self.img_npy = [self.im_cache_dir / Path(f).with_suffix('.npy').name for f in self.img_files]
-                self.im_cache_dir.mkdir(parents=True, exist_ok=True)
-            gb = 0  # Gigabytes of cached images
-            self.img_hw0, self.img_hw = [None] * n, [None] * n
-            results = ThreadPool(NUM_THREADS).imap(lambda x: load_image_label(*x), zip(repeat(self), range(n)))
-            pbar = tqdm(enumerate(results), total=n)
-            for i, x in pbar:
-                if cache_images == 'disk':
-                    if not self.img_npy[i].exists():
-                        np.save(self.img_npy[i].as_posix(), x[0])
-                    gb += self.img_npy[i].stat().st_size
-                else:
-                    self.imgs[i], self.img_hw0[i], self.img_hw[i], self.labels[i] = x  # im, hw_orig, hw_resized, label_resized = load_image_label(self, i)
-                    gb += self.imgs[i].nbytes
-                pbar.desc = f'{prefix}Caching images ({gb / 1E9:.1f}GB {cache_images})'
-            pbar.close()
+        
+
+        # # Cache images into memory for faster training (WARNING: large datasets may exceed system RAM)
+        # self.imgs, self.img_npy = [None] * n, [None] * n
+        # if cache_images:
+        #     if cache_images == 'disk':
+        #         self.im_cache_dir = Path(Path(self.img_files[0]).parent.as_posix() + '_npy')
+        #         self.img_npy = [self.im_cache_dir / Path(f).with_suffix('.npy').name for f in self.img_files]
+        #         self.im_cache_dir.mkdir(parents=True, exist_ok=True)
+        #     gb = 0  # Gigabytes of cached images
+        #     self.img_hw0, self.img_hw = [None] * n, [None] * n
+        #     results = ThreadPool(NUM_THREADS).imap(lambda x: load_image_label(*x), zip(repeat(self), range(n)))
+        #     pbar = tqdm(enumerate(results), total=n)
+        #     for i, x in pbar:
+        #         if cache_images == 'disk':
+        #             if not self.img_npy[i].exists():
+        #                 np.save(self.img_npy[i].as_posix(), x[0])
+        #             gb += self.img_npy[i].stat().st_size
+        #         else:
+        #             self.imgs[i], self.img_hw0[i], self.img_hw[i], self.labels[i] = x  # im, hw_orig, hw_resized, label_resized = load_image_label(self, i)
+        #             gb += self.imgs[i].nbytes
+        #         pbar.desc = f'{prefix}Caching images ({gb / 1E9:.1f}GB {cache_images})'
+        #     pbar.close()
 
     def cache_labels(self, path=Path('./labels.cache'), prefix=''):
         # Cache dataset labels, check images and read shapes
@@ -567,10 +683,337 @@ class LoadImagesAndLabels(Dataset):
             img_file (str): img_dir 
             shapes : None or [(h_raw, w_raw), (hw_ratios, wh_paddings)], for COCO mAP rescaling
         '''
-        index = self.indices[index]  # linear, shuffled, or image_weights
+        # index = self.indices[index]  # linear, shuffled, or image_weights
 
         hyp = self.hyp
         mosaic = self.mosaic and random.random() < hyp['mosaic']
+
+        if mosaic:
+            # Load mosaic
+            img, labels = load_mosaic(self, index)
+            shapes = None
+
+            # MixUp augmentation
+            if random.random() < hyp['mixup']:
+                img, labels = mixup(img, labels, *load_mosaic(self, random.randint(0, self.n - 1)))
+
+        else:
+            # Load image and label
+            img, (h0, w0), (h, w), img_label = load_image_label(self, index) 
+
+            # Letterbox
+            shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape [h_rect, w_rect]
+            img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment) # ratio[w_ratio, h_ratio], pad[w_padding, h_padding]
+            shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling [(h_raw, w_raw), (hw_ratios, wh_paddings)]
+
+            labels = img_label.copy() # labels (array): (num_gt_perimg, [cls_id, poly])
+            if labels.size:  
+                # labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+                labels[:, [1, 3, 5, 7]] = img_label[:, [1, 3, 5, 7]] * ratio[0] + pad[0]
+                labels[:, [2, 4, 6, 8]] = img_label[:, [2, 4, 6, 8]] * ratio[1] + pad[1]
+
+            if self.augment:
+                img, labels = random_perspective(img, labels,
+                                                 degrees=hyp['degrees'],
+                                                 translate=hyp['translate'],
+                                                 scale=hyp['scale'],
+                                                 shear=hyp['shear'],
+                                                 perspective=hyp['perspective'])
+
+        nl = len(labels)  # number of labels
+        # if nl:
+        #     labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1E-3)
+
+
+        if self.augment:
+            # Albumentations
+            # img, labels = self.albumentations(img, labels)
+            # nl = len(labels)  # update after albumentations
+
+            # HSV color-space
+            augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
+
+            img_h, img_w = img.shape[0], img.shape[1]
+            # Flip up-down
+            if random.random() < hyp['flipud']:
+                img = np.flipud(img)
+                if nl:
+                    # labels[:, 2] = 1 - labels[:, 2]
+                    labels[:, 2::2] = img_h - labels[:, 2::2] - 1
+
+            # Flip left-right
+            if random.random() < hyp['fliplr']:
+                img = np.fliplr(img)
+                if nl:
+                    # labels[:, 1] = 1 - labels[:, 1]
+                    labels[:, 1::2] = img_w - labels[:, 1::2] - 1
+
+            # Cutouts
+            # labels = cutout(img, labels, p=0.5)
+            # nl = len(labels)  # update after cutout
+        if nl:
+        # *[clsid poly] to *[clsid cx cy l s theta gaussian_θ_labels] θ∈[-pi/2, pi/2) non-normalized
+            rboxes, csl_labels  = poly2rbox(polys=labels[:, 1:], 
+                                            num_cls_thata=hyp['cls_theta'] if hyp else 180, 
+                                            radius=hyp['csl_radius'] if hyp else 6.0, 
+                                            use_pi=True, use_gaussian=True)
+            labels_obb = np.concatenate((labels[:, :1], rboxes, csl_labels), axis=1)
+            labels_mask = (rboxes[:, 0] >= 0) & (rboxes[:, 0] < img.shape[1]) \
+                        & (rboxes[:, 1] >= 0) & (rboxes[:, 0] < img.shape[0]) \
+                        & (rboxes[:, 2] > 5) | (rboxes[:, 3] > 5)
+            labels_obb = labels_obb[labels_mask]
+            nl = len(labels_obb)  # update after filter
+        
+        if hyp:
+            c_num = 7 + hyp['cls_theta'] # [index_of_batch clsid cx cy l s theta gaussian_θ_labels]
+        else:
+            c_num = 187
+
+        # labels_out = torch.zeros((nl, 6))
+        labels_out = torch.zeros((nl, c_num))
+        if nl:
+            # labels_out[:, 1:] = torch.from_numpy(labels)
+            labels_out[:, 1:] = torch.from_numpy(labels_obb)
+
+        # Convert
+        img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+        img = np.ascontiguousarray(img)
+
+        return torch.from_numpy(img), labels_out, self.img_files[index], shapes
+
+    @staticmethod
+    def collate_fn(batch):
+        img, label, path, shapes = zip(*batch)  # transposed; (tupe(b*tensor))
+        for i, l in enumerate(label):
+            l[:, 0] = i  # add target image index for build_targets()
+        return torch.stack(img, 0), torch.cat(label, 0), path, shapes
+
+    @staticmethod
+    def collate_fn4(batch):
+        img, label, path, shapes = zip(*batch)  # transposed
+        n = len(shapes) // 4
+        img4, label4, path4, shapes4 = [], [], path[:n], shapes[:n]
+
+        ho = torch.tensor([[0.0, 0, 0, 1, 0, 0]])
+        wo = torch.tensor([[0.0, 0, 1, 0, 0, 0]])
+        s = torch.tensor([[1, 1, 0.5, 0.5, 0.5, 0.5]])  # scale
+        for i in range(n):  # zidane torch.zeros(16,3,720,1280)  # BCHW
+            i *= 4
+            if random.random() < 0.5:
+                im = F.interpolate(img[i].unsqueeze(0).float(), scale_factor=2.0, mode='bilinear', align_corners=False)[
+                    0].type(img[i].type())
+                l = label[i]
+            else:
+                im = torch.cat((torch.cat((img[i], img[i + 1]), 1), torch.cat((img[i + 2], img[i + 3]), 1)), 2)
+                l = torch.cat((label[i], label[i + 1] + ho, label[i + 2] + wo, label[i + 3] + ho + wo), 0) * s
+            img4.append(im)
+            label4.append(l)
+
+        for i, l in enumerate(label4):
+            l[:, 0] = i  # add target image index for build_targets()
+
+        return torch.stack(img4, 0), torch.cat(label4, 0), path4, shapes4
+
+
+class LoadMobis2ImagesAndLabels(Dataset):
+    # YOLOv5 train_loader/val_loader, loads images and labels for training and validation
+    cache_version = 0.6  # dataset labels *.cache version
+
+    def __init__(self, path, mode, cls_names, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False, cache_images=False, single_cls=False, stride=32, pad=0.0, prefix=''):
+        """
+        Returns:
+            Dataset.labels (list): n_imgs * array(num_gt_perimg, [cls_id, poly])
+            Dataset.shapes (array): (n_imgs, [ori_img_width, ori_img_height])
+
+            Dataset.batch_shapes (array): (n_batches, [h_rect, w_rect])
+        """
+        self.img_size = img_size
+        self.augment = augment
+        self.hyp = hyp
+        self.image_weights = image_weights
+        self.rect = False if image_weights else rect
+        self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
+        self.mosaic_border = [-img_size // 2, -img_size // 2]
+        self.stride = stride
+        self.path = '/root/jupyter/personal/dataset/rg3_17'
+        self.albumentations = Albumentations() if augment else None
+        self.cls_names = cls_names
+        self.mode = mode
+
+        file_list = os.listdir(self.path)
+        self.img_files = sorted([os.path.join(self.path, f) for f in file_list if f.endswith('PNG')])
+        
+        n = len(self.img_files)
+        if self.mode == 'train':
+            self.img_files = self.img_files[:n*4//5]
+        else:
+            self.img_files = self.img_files[n*4//5:]
+        
+        assert self.img_files, f'{prefix}No images found'
+
+        # Check cache
+        self.label_files = img2label_paths(self.img_files)  # labels
+        # cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')
+        # try:
+        #     cache, exists = np.load(cache_path, allow_pickle=True).item(), True  # load dict
+        #     assert cache['version'] == self.cache_version  # same version
+        #     assert cache['hash'] == get_hash(self.label_files + self.img_files)  # same hash
+        # except:
+        #     cache, exists = self.cache_labels(cache_path, prefix), False  # cache
+
+        # # Read cache
+        # [cache.pop(k) for k in ('hash', 'version', 'msgs')]  # remove items
+        # labels, shapes, self.segments = zip(*cache.values())
+        # self.labels = list(labels) # labels(list[array]): n_imgs * array(num_gt_perimg, [cls_id, poly])
+        # self.shapes = np.array(shapes, dtype=np.float64) # img_ori shape
+        # self.img_files = list(cache.keys())  # update
+        # self.label_files = img2label_paths(cache.keys())  # update
+        # n = len(shapes)  # number of images
+        n = len(self.img_files)
+        bi = np.floor(np.arange(n) / batch_size).astype(int)  # batch index
+        nb = bi[-1] + 1  # number of batches
+        self.batch = bi  # batch index of image
+        self.n = n
+        # self.indices = range(n)
+
+        self.labels = []
+        for l_f in self.label_files:
+            with open(l_f) as f:
+                anno = orjson.loads(f.read())
+                anno = anno['shapes'][-1]
+
+                boxes = anno['points']
+                (x1, y1), (x2, y2) = boxes[0], boxes[1]
+                boxes = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+                classes = anno['label']
+                
+                self.labels.append([[CLASSES_2[classes]]+sum(boxes, [])])    # [n_boxes, [class, x1, y1, x2, y1, ...]]
+        self.labels = np.array(self.labels)
+        self.shapes = np.array([[480, 640]]*self.n)
+        self.indices = range(self.n)
+        
+        # # Update labels
+        # include_class = []  # filter labels to include only these classes (optional)
+        # include_class_array = np.array(include_class).reshape(1, -1)
+        # for i, (label, segment) in enumerate(zip(self.labels, self.segments)):
+        #     if include_class:
+        #         j = (label[:, 0:1] == include_class_array).any(1)
+        #         self.labels[i] = label[j]
+        #         if segment:
+        #             self.segments[i] = segment[j]
+        #     if single_cls:  # single-class training, merge all classes into 0
+        #         self.labels[i][:, 0] = 0
+        #         if segment:
+        #             self.segments[i][:, 0] = 0
+        self.segment = None
+
+        # Rectangular Training
+        if self.rect:
+            # Sort by aspect ratio
+            s = self.shapes  # wh
+            ar = s[:, 1] / s[:, 0]  # aspect ratio
+            irect = ar.argsort()
+            self.img_files = [self.img_files[i] for i in irect]
+            self.label_files = [self.label_files[i] for i in irect]
+            self.labels = [self.labels[i] for i in irect]
+            self.shapes = s[irect]  # wh
+            ar = ar[irect]
+
+            # Set training image shapes
+            shapes = [[1, 1]] * nb
+            for i in range(nb):
+                ari = ar[bi == i]
+                mini, maxi = ari.min(), ari.max()
+                if maxi < 1: # batch图像高宽比均小于1时, shape=[h/w, 1] = [h_ratio, w_ratio]
+                    shapes[i] = [maxi, 1] 
+                elif mini > 1: # batch图像高宽比均大于1时, shape=[1, w/h] = [h_ratio, w_ratio]
+                    shapes[i] = [1, 1 / mini]
+
+            self.batch_shapes = np.ceil(np.array(shapes) * (480, 640) / stride + pad).astype(int) * stride # (nb, [h_rect, w_rect])
+
+        
+
+        # # Cache images into memory for faster training (WARNING: large datasets may exceed system RAM)
+        # self.imgs, self.img_npy = [None] * n, [None] * n
+        # if cache_images:
+        #     if cache_images == 'disk':
+        #         self.im_cache_dir = Path(Path(self.img_files[0]).parent.as_posix() + '_npy')
+        #         self.img_npy = [self.im_cache_dir / Path(f).with_suffix('.npy').name for f in self.img_files]
+        #         self.im_cache_dir.mkdir(parents=True, exist_ok=True)
+        #     gb = 0  # Gigabytes of cached images
+        #     self.img_hw0, self.img_hw = [None] * n, [None] * n
+        #     results = ThreadPool(NUM_THREADS).imap(lambda x: load_image_label(*x), zip(repeat(self), range(n)))
+        #     pbar = tqdm(enumerate(results), total=n)
+        #     for i, x in pbar:
+        #         if cache_images == 'disk':
+        #             if not self.img_npy[i].exists():
+        #                 np.save(self.img_npy[i].as_posix(), x[0])
+        #             gb += self.img_npy[i].stat().st_size
+        #         else:
+        #             self.imgs[i], self.img_hw0[i], self.img_hw[i], self.labels[i] = x  # im, hw_orig, hw_resized, label_resized = load_image_label(self, i)
+        #             gb += self.imgs[i].nbytes
+        #         pbar.desc = f'{prefix}Caching images ({gb / 1E9:.1f}GB {cache_images})'
+        #     pbar.close()
+
+    def cache_labels(self, path=Path('./labels.cache'), prefix=''):
+        # Cache dataset labels, check images and read shapes
+        x = {}  # dict
+        nm, nf, ne, nc, msgs = 0, 0, 0, 0, []  # number missing, found, empty, corrupt, messages
+        desc = f"{prefix}Scanning '{path.parent / path.stem}' images and labels..."
+        with Pool(NUM_THREADS) as pool:
+            pbar = tqdm(pool.imap(verify_image_label, zip(self.img_files, self.label_files, repeat(prefix), repeat(self.cls_names))),
+                        desc=desc, total=len(self.img_files))
+            for im_file, l, shape, segments, nm_f, nf_f, ne_f, nc_f, msg in pbar:
+                nm += nm_f
+                nf += nf_f
+                ne += ne_f
+                nc += nc_f
+                if im_file:
+                    x[im_file] = [l, shape, segments] 
+                if msg:
+                    msgs.append(msg)
+                pbar.desc = f"{desc}{nf} found, {nm} missing, {ne} empty, {nc} corrupted"
+
+        pbar.close()
+        if msgs:
+            LOGGER.info('\n'.join(msgs))
+        if nf == 0:
+            LOGGER.warning(f'{prefix}WARNING: No labels found in {path}. See {HELP_URL}')
+        x['hash'] = get_hash(self.label_files + self.img_files)
+        x['results'] = nf, nm, ne, nc, len(self.img_files)
+        x['msgs'] = msgs  # warnings
+        x['version'] = self.cache_version  # cache version
+        try:
+            np.save(path, x)  # save cache for next time
+            path.with_suffix('.cache.npy').rename(path)  # remove .npy suffix
+            LOGGER.info(f'{prefix}New cache created: {path}')
+        except Exception as e:
+            LOGGER.warning(f'{prefix}WARNING: Cache directory {path.parent} is not writeable: {e}')  # not writeable
+        return x
+
+    def __len__(self):
+        return len(self.img_files)
+
+    # def __iter__(self):
+    #     self.count = -1
+    #     print('ran dataset iter')
+    #     #self.shuffled_vector = np.random.permutation(self.nF) if self.augment else np.arange(self.nF)
+    #     return self
+
+    def __getitem__(self, index):
+        '''
+        Augment the [clsid poly] labels and trans label format to rbox.
+        Returns:
+            img (tensor): (3, height, width), RGB
+            labels_out (tensor): (n, [None clsid cx cy l s theta gaussian_θ_labels]) θ∈[-pi/2, pi/2)
+            img_file (str): img_dir 
+            shapes : None or [(h_raw, w_raw), (hw_ratios, wh_paddings)], for COCO mAP rescaling
+        '''
+        # index = self.indices[index]  # linear, shuffled, or image_weights
+
+        hyp = self.hyp
+        mosaic = self.mosaic and random.random() < hyp['mosaic']
+
         if mosaic:
             # Load mosaic
             img, labels = load_mosaic(self, index)
@@ -700,26 +1143,18 @@ class LoadImagesAndLabels(Dataset):
 
 # Ancillary functions --------------------------------------------------------------------------------------------------
 def load_image_label(self, i):
-    # loads 1 image from dataset index 'i', returns im, original hw, resized hw
-    im = self.imgs[i]
     label = self.labels[i].copy() # labels (array): (num_gt_perimg, [cls_id, poly])
-    if im is None:  # not cached in ram
-        npy = self.img_npy[i]
-        if npy and npy.exists():  # load npy
-            im = np.load(npy)
-        else:  # read image
-            path = self.img_files[i]
-            im = cv2.imread(path)  # BGR
-            assert im is not None, f'Image Not Found {path}'
-        h0, w0 = im.shape[:2]  # orig hw
-        r = self.img_size / max(h0, w0)  # ratio
-        if r != 1:  # if sizes are not equal
-            im = cv2.resize(im, (int(w0 * r), int(h0 * r)),
-                            interpolation=cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR)
-            label[:, 1:] *= r
+    path = self.img_files[i]
+    im = cv2.imread(path)  # BGR
+    assert im is not None, f'Image Not Found {path}'
+
+    h0, w0 = im.shape[:2]  # orig hw
+    r = self.img_size / max(h0, w0)  # ratio
+    if r != 1:  # if sizes are not equal
+        im = cv2.resize(im, (int(w0 * r), int(h0 * r)),
+                        interpolation=cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR)
+        label[:, 1:] *= r
         return im, (h0, w0), im.shape[:2], label  # im, hw_original, hw_resized, resized_label
-    else:
-        return self.imgs[i], self.img_hw0[i], self.img_hw[i], self.labels[i]  # im, hw_original, hw_resized, resized_label
 
 
 def load_mosaic(self, index):
@@ -753,20 +1188,16 @@ def load_mosaic(self, index):
         padh = y1a - y1b
 
         # Labels
-        labels, segments = img_label.copy(), self.segments[index].copy() # labels (array): (num_gt_perimg, [cls_id, poly])
+        labels = img_label.copy() # labels (array): (num_gt_perimg, [cls_id, poly])
         if labels.size:
             # labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padw, padh)  # normalized xywh to pixel xyxy format
             labels[:, [1, 3, 5, 7]] = img_label[:, [1, 3, 5, 7]] + padw
             labels[:, [2, 4, 6, 8]] = img_label[:, [2, 4, 6, 8]] + padh
-            segments = [xyn2xy(x, w, h, padw, padh) for x in segments]
         labels4.append(labels)
-        segments4.extend(segments)
 
     # Concat/clip labels
     labels4 = np.concatenate(labels4, 0)
     # for x in (labels4[:, 1:], *segments4):
-    for x in (segments4):
-        np.clip(x, 0, 2 * s, out=x)  # clip when using random_perspective()
     h_filter = 2 * s
     w_filter = 2 * s
     labels_mask = poly_filter(polys=labels4[:, 1:].copy(), h=h_filter, w=w_filter)
@@ -915,7 +1346,7 @@ def extract_boxes(path='../datasets/coco128'):  # from utils.datasets import *; 
                     b = x[1:] * [w, h, w, h]  # box
                     # b[2:] = b[2:].max()  # rectangle to square
                     b[2:] = b[2:] * 1.2 + 3  # pad
-                    b = xywh2xyxy(b.reshape(-1, 4)).ravel().astype(np.int)
+                    b = xywh2xyxy(b.reshape(-1, 4)).ravel().astype(int)
 
                     b[[0, 2]] = np.clip(b[[0, 2]], 0, w)  # clip boxes outside of image
                     b[[1, 3]] = np.clip(b[[1, 3]], 0, h)
@@ -1108,3 +1539,32 @@ def dataset_stats(path='coco128.yaml', autodownload=False, verbose=False, profil
     if verbose:
         print(json.dumps(stats, indent=2, sort_keys=False))
     return stats
+
+
+def random_rotate(image, label, angle=10):
+    h, w = image.shape[:2]
+    cx, cy = w//2, h//2
+    
+    rand = random.uniform(-1*angle, angle)
+    M = cv2.getRotationMatrix2D((cx, cy), rand, 1.0)
+    image = cv2.warpAffine(image, M, (w, h))
+
+    if label is not None:
+        for i in range(4):
+            label[:, 1+2*i:3+2*i] = (label[:, 1+2*i:3+2*i] - np.array([cx, cy])) @ M[:, :2].T + np.array([cx, cy])
+
+    return image, label
+
+
+def random_shift(image, label, scale=0.2):
+    h, w = image.shape[:2]
+
+    (dx, dy) = np.random.uniform(-1*scale, scale, 2)
+    M = np.array([[1, 0, dx*w],
+                  [0, 1, dy*h]])
+    image = cv2.warpAffine(image, M, (w, h))
+
+    if label is not None:
+        label[:, 1:] += np.array([dx*w, dy*h]*4)
+    
+    return image, label

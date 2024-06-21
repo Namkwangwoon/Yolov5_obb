@@ -15,7 +15,7 @@ ROOT = FILE.parents[3]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 
-from utils.datasets import LoadImagesAndLabels, img2label_paths
+from utils.datasets import LoadMobisImagesAndLabels, img2label_paths
 from utils.general import LOGGER, check_dataset, check_file
 
 try:
@@ -342,12 +342,12 @@ class WandbLogger():
 
         # log train set
         if not log_val_only:
-            self.train_artifact = self.create_dataset_table(LoadImagesAndLabels(
+            self.train_artifact = self.create_dataset_table(LoadMobisImagesAndLabels(
                 data['train'], rect=True, batch_size=1), names, name='train') if data.get('train') else None
             if data.get('train'):
                 data['train'] = WANDB_ARTIFACT_PREFIX + str(Path(project) / 'train')
 
-        self.val_artifact = self.create_dataset_table(LoadImagesAndLabels(
+        self.val_artifact = self.create_dataset_table(LoadMobisImagesAndLabels(
             data['val'], rect=True, batch_size=1), names, name='val') if data.get('val') else None
         if data.get('val'):
             data['val'] = WANDB_ARTIFACT_PREFIX + str(Path(project) / 'val')
@@ -386,12 +386,12 @@ class WandbLogger():
         for i, data in enumerate(tqdm(self.val_table.data)):
             self.val_table_path_map[data[3]] = data[0]
 
-    def create_dataset_table(self, dataset: LoadImagesAndLabels, class_to_id: Dict[int, str], name: str = 'dataset'):
+    def create_dataset_table(self, dataset: LoadMobisImagesAndLabels, class_to_id: Dict[int, str], name: str = 'dataset'):
         """
         Create and return W&B artifact containing W&B Table of the dataset.
 
         arguments:
-        dataset -- instance of LoadImagesAndLabels class used to iterate over the data to build Table
+        dataset -- instance of LoadMobisImagesAndLabels class used to iterate over the data to build Table
         class_to_id -- hash map that maps class ids to labels
         name -- name of the artifact
 

@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+from shapely.geometry import Polygon
+
 
 def fitness(x):
     # Model fitness as a weighted combination of metrics
@@ -65,6 +67,8 @@ def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names
 
             # AP from recall-precision curve
             for j in range(tp.shape[1]):
+                print('recall[:, j] : ', recall[:, j].shape, recall[:, j])
+                print('precision[:, k] : ', precision[:, k].shape, precision[:, k])
                 ap[ci, j], mpre, mrec = compute_ap(recall[:, j], precision[:, j])
                 if plot and j == 0:
                     py.append(np.interp(px, mrec, mpre))  # precision at mAP@0.5
@@ -136,6 +140,44 @@ class ConfusionMatrix:
         gt_classes = labels[:, 0].int()
         detection_classes = detections[:, 5].int()
         iou = box_iou(labels[:, 1:], detections[:, :4])
+
+        x = torch.where(iou > self.iou_thres)
+        if x[0].shape[0]:
+            matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()
+            if x[0].shape[0] > 1:
+                matches = matches[matches[:, 2].argsort()[::-1]]
+                matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
+                matches = matches[matches[:, 2].argsort()[::-1]]
+                matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
+        else:
+            matches = np.zeros((0, 3))
+
+        n = matches.shape[0] > 0
+        m0, m1, _ = matches.transpose().astype(np.int16)
+        for i, gc in enumerate(gt_classes):
+            j = m0 == i
+            if n and sum(j) == 1:
+                self.matrix[detection_classes[m1[j]], gc] += 1  # correct
+            else:
+                self.matrix[self.nc, gc] += 1  # background FP
+
+        if n:
+            for i, dc in enumerate(detection_classes):
+                if not any(m1 == i):
+                    self.matrix[dc, self.nc] += 1  # background FN
+                    
+    def process_batch_2(self, polys, tpolys):
+        """
+        Arguments:
+            polys (Array[N, 10]), x1, y1, x2, y2, x3, y3, x4, y4, conf, class
+            tpolys (Array[M, 9]), class, x1, y1, x2, y2, x3, y3, x4, y4
+        Returns:
+            None, updates confusion matrix accordingly
+        """
+        polys = polys[polys[:, 8] > self.conf]
+        gt_classes = tpolys[:, 0].int()
+        detection_classes = polys[:, -1].int()
+        iou = poly_iou(tpolys[:, 1:], polys[:, :8])
 
         x = torch.where(iou > self.iou_thres)
         if x[0].shape[0]:
@@ -266,6 +308,32 @@ def box_iou(box1, box2):
     # inter(N,M) = (rb(N,M,2) - lt(N,M,2)).clamp(0).prod(2)
     inter = (torch.min(box1[:, None, 2:], box2[:, 2:]) - torch.max(box1[:, None, :2], box2[:, :2])).clamp(0).prod(2)
     return inter / (area1[:, None] + area2 - inter)  # iou = inter / (area1 + area2 - inter)
+
+
+def poly_iou(poly1, poly2):
+    """
+    Return intersection-over-union (Jaccard index) of boxes.
+    Both sets of boxes are expected to be in (x1, y1, x2, y2, x3, y3, x4, y4) format.
+    Arguments:
+        poly1 (Tensor[N, 8])
+        poly2 (Tensor[M, 8])
+    Returns:
+        iou (Tensor[N, M]): the NxM matrix containing the pairwise
+            IoU values for every element in boxes1 and boxes2
+    """
+
+    N, M = poly1.shape[0], poly2.shape[0]
+    iou = torch.zeros(N, M, dtype=torch.float32, device=poly1.device)
+
+    for n in range(N):
+        for m in range(M):
+            p1 = Polygon(poly1[n].reshape(-1, 2).detach().cpu())
+            p2 = Polygon(poly2[m].reshape(-1, 2).detach().cpu())
+            inter = p1.intersection(p2).area
+            union = p1.union(p2).area
+            iou[n][m] = inter / union
+
+    return iou  # iou = inter / (area1 + area2 - inter)
 
 
 def bbox_ioa(box1, box2, eps=1E-7):

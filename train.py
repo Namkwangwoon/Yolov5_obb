@@ -98,8 +98,18 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     plots = not evolve  # create plots
     cuda = device.type != 'cpu'
     init_seeds(1 + RANK)
-    with torch_distributed_zero_first(LOCAL_RANK):
-        data_dict = data_dict or check_dataset(data)  # check if None
+    # with torch_distributed_zero_first(LOCAL_RANK):
+    #     data_dict = data_dict or check_dataset(data)  # check if None
+
+    data_dict = {
+        # 'train' : '/root/jupyter/personal/dataset/mobis',
+        # 'val' : '/root/jupyter/personal/dataset/mobis',
+        'train' : '/root/jupyter/personal/dataset/rg3_17',
+        'val' : '/root/jupyter/personal/dataset/rg3_17',
+        'nc' : 1,
+        'names' : ['BOX'],
+    }
+    
     train_path, val_path = data_dict['train'], data_dict['val']
     nc = 1 if single_cls else int(data_dict['nc'])  # number of classes
     names = ['item'] if single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
@@ -155,9 +165,12 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             g1.append(v.weight)
 
     if opt.adam:
-        optimizer = Adam(g0, lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
+        # optimizer = Adam(g0, lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
+        print("opt.lr : ", opt.lr)
+        optimizer = Adam(g0, lr=opt.lr, betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
     else:
-        optimizer = SGD(g0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
+        # optimizer = SGD(g0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
+        optimizer = SGD(g0, lr=opt.lr, momentum=hyp['momentum'], nesterov=True)
 
     optimizer.add_param_group({'params': g1, 'weight_decay': hyp['weight_decay']})  # add g1 with weight_decay
     optimizer.add_param_group({'params': g2})  # add g2 (biases)
@@ -210,17 +223,19 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         LOGGER.info('Using SyncBatchNorm()')
 
     # Trainloader
-    train_loader, dataset = create_dataloader(train_path, imgsz, batch_size // WORLD_SIZE, gs, names, single_cls,
+    train_loader, dataset = create_dataloader(train_path, 'train', imgsz, batch_size // WORLD_SIZE, gs, names, single_cls,
                                               hyp=hyp, augment=True, cache=opt.cache, rect=opt.rect, rank=LOCAL_RANK,
                                               workers=workers, image_weights=opt.image_weights, quad=opt.quad,
                                               prefix=colorstr('train: '), shuffle=True)
+
+    
     mlc = int(np.concatenate(dataset.labels, 0)[:, 0].max())  # max label class
     nb = len(train_loader)  # number of batches
     assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}'
 
     # Process 0
     if RANK in [-1, 0]:
-        val_loader = create_dataloader(val_path, imgsz, batch_size // WORLD_SIZE * 2, gs, names, single_cls,
+        val_loader = create_dataloader(val_path, 'val', imgsz, batch_size // WORLD_SIZE * 2, gs, names, single_cls,
                                        hyp=hyp, cache=None if noval else opt.cache, rect=True, rank=-1,
                                        workers=workers, pad=0.5,
                                        prefix=colorstr('val: '))[0]
@@ -390,10 +405,14 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                         'wandb_id': loggers.wandb.wandb_run.id if loggers.wandb else None,
                         'date': datetime.now().isoformat()}
 
+                last = w / ("%s epoch.pt"%(epoch))
                 # Save last, best and delete
-                torch.save(ckpt, last)
                 if best_fitness == fi:
+                    best = w / ("best(%s epoch).pt"%(epoch))
                     torch.save(ckpt, best)
+                else:
+                    torch.save(ckpt, last)
+                    
                 if (epoch > 0) and (opt.save_period > 0) and (epoch % opt.save_period == 0):
                     torch.save(ckpt, w / f'epoch{epoch}.pt')
                 del ckpt
@@ -449,9 +468,9 @@ def parse_opt(known=False):
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', type=str, default=ROOT / 'weights/yolov5n.pt', help='initial weights path')
     parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
-    parser.add_argument('--data', type=str, default=ROOT / 'data/DroneVehicle_poly.yaml', help='dataset.yaml path')
+    parser.add_argument('--data', type=str, default=ROOT / 'data/Mobis.yaml', help='dataset.yaml path')
     parser.add_argument('--hyp', type=str, default=ROOT / 'data/hyps/obb/hyp.finetune_dota.yaml', help='hyperparameters path')
-    parser.add_argument('--epochs', type=int, default=5)
+    parser.add_argument('--epochs', type=int, default=300)
     parser.add_argument('--batch-size', type=int, default=128, help='total batch size for all GPUs, -1 for autobatch')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=840, help='train, val image size (pixels)')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
@@ -468,14 +487,14 @@ def parse_opt(known=False):
     parser.add_argument('--single-cls', action='store_true', help='train multi-class data as single-class')
     parser.add_argument('--adam', action='store_true', help='use torch.optim.Adam() optimizer')
     parser.add_argument('--sync-bn', action='store_true', help='use SyncBatchNorm, only available in DDP mode')
-    parser.add_argument('--workers', type=int, default=8, help='max dataloader workers (per RANK in DDP mode)')
+    parser.add_argument('--workers', type=int, default=0, help='max dataloader workers (per RANK in DDP mode)')
     parser.add_argument('--project', default=ROOT / 'runs/train', help='save to project/name')
     parser.add_argument('--name', default='exp', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--quad', action='store_true', help='quad dataloader')
     parser.add_argument('--linear-lr', action='store_true', help='linear LR')
     parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing epsilon')
-    parser.add_argument('--patience', type=int, default=100, help='EarlyStopping patience (epochs without improvement)')
+    parser.add_argument('--patience', type=int, default=300, help='EarlyStopping patience (epochs without improvement)')
     parser.add_argument('--freeze', nargs='+', type=int, default=[0], help='Freeze layers: backbone=10, first3=0 1 2')
     parser.add_argument('--save-period', type=int, default=-1, help='Save checkpoint every x epochs (disabled if < 1)')
     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
@@ -485,8 +504,10 @@ def parse_opt(known=False):
     parser.add_argument('--upload_dataset', nargs='?', const=True, default=False, help='W&B: Upload data, "val" option')
     parser.add_argument('--bbox_interval', type=int, default=-1, help='W&B: Set bounding-box image logging interval')
     parser.add_argument('--artifact_alias', type=str, default='latest', help='W&B: Version of dataset artifact to use')
+    parser.add_argument('--lr', type=float, default=1e-2)
 
     opt = parser.parse_known_args()[0] if known else parser.parse_args()
+    
     return opt
 
 
