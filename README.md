@@ -68,3 +68,5 @@ I have used utility functions from other wonderful open-source projects. Espeici
   Name  : "胡凯旋"
   describe myself："咸鱼一枚"
 
+# Reference
+https://github.com/hukaixuan19970627/yolov5_obb.git
