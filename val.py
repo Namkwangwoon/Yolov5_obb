@@ -266,7 +266,7 @@ def run(data,
                 tpoly = rbox2poly(labels[:, 1:6]) # target poly
                 tbox = xywh2xyxy(poly2hbb(tpoly)) # target  hbb boxes [xyxy]
                 scale_coords(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
-                scale_coords(im[si].shape[1:], tpoly, shape, shapes[si][1])  # native-space labels
+                scale_polys(im[si].shape[1:], tpoly, shape, shapes[si][1])  # native-space labels
                 labels_hbbn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels (n, [cls xyxy])
                 labels_polyn = torch.cat((labels[:, 0:1], tpoly), 1)  # native-space labels (n, [cls xyxy])
                 correct = process_batch(pred_hbbn, labels_hbbn, iouv)
