@@ -286,8 +286,8 @@ def run(data,
             # if save_json: # save hbb pred results and poly pred results.
             #     save_one_json(pred_hbbn, pred_polyn, jdict, path, class_map)  # append to COCO-JSON dictionary
             #     # LOGGER.info('The hbb and obb results has been saved in json file')
-            callbacks.run('on_val_image_end', pred_hbb, pred_hbbn, path, names, im[si])
-            # callbacks.run('on_val_image_end', pred_poly, pred_polyn, path, names, im[si])
+            # callbacks.run('on_val_image_end', pred_hbb, pred_hbbn, path, names, im[si])
+            callbacks.run('on_val_image_end', pred_poly, pred_polyn, path, names, im[si])
 
         # Plot images
         if plots and batch_i < 3:
@@ -299,9 +299,6 @@ def run(data,
     # Compute metrics
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
     if len(stats) and stats[0].any():
-        print()
-        print('1!!')
-        print()
         tp, fp, p, r, f1, ap, ap_class = ap_per_class(*stats, plot=plots, save_dir=save_dir, names=names)
         ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
         mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
