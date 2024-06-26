@@ -67,8 +67,6 @@ def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names
 
             # AP from recall-precision curve
             for j in range(tp.shape[1]):
-                print('recall[:, j] : ', recall[:, j].shape, recall[:, j])
-                print('precision[:, k] : ', precision[:, k].shape, precision[:, k])
                 ap[ci, j], mpre, mrec = compute_ap(recall[:, j], precision[:, j])
                 if plot and j == 0:
                     py.append(np.interp(px, mrec, mpre))  # precision at mAP@0.5
